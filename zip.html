@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Global Address Lookup (Minimal POC)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;max-width:850px;margin:20px auto;padding:0 18px;color:#111; background:#fff;}
+  h1{font-size:20px;margin-bottom:8px}
+  label{display:block;margin-top:12px;font-weight:600}
+  input,button{padding:8px 10px;font-size:15px;border:1px solid #ccc;border-radius:0;}
+  input{background:#fff;}
+  button{cursor:pointer; background: #f0f0f0;}
+  button:disabled{cursor:wait;background:#f0f0f0; color: #888;}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .card{background:#fff;border: 1px solid #ddd;padding:16px;margin-top:18px}
+  .title{font-weight:700;margin-bottom:8px}
+  .pill{display:inline-block;background:#f0f0f0;color:#111;padding:6px 12px;font-size:14px;margin:3px 4px;border:1px solid #d1d5db}
+  .result{margin-top:16px;padding:12px;background:#f9f9fa;border:1px solid #e0e0e0}
+  table{width:100%;border-collapse:collapse;margin-top:8px}
+  td,th{border:1px solid #eee;padding:6px 8px;text-align:left}
+  th{background:#f2f2f2}
+  pre{background:#f6f6f6;padding:10px;border-radius:0;max-height:250px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+  .hint{font-size:13px;color:#555}
+  .error{color:#c00;font-weight:600}
+  .hidden{display:none}
+</style>
+</head>
+<body>
+<h1>Global Address Lookup</h1>
+<p class="hint">
+Enter a postal or ZIP code and (optionally) country name.<br>
+Automatically uses Nominatim if OpenCage fails and reverse lookup for missing State/Region.<br>
+Requires <strong>country, state, city</strong>.
+</p>
+
+<div class="row">
+  <input id="postal" placeholder="Postal / ZIP code" style="flex:1;min-width:180px">
+  <input id="country" placeholder="Country (optional)" style="flex:1;min-width:180px">
+  <button id="lookup">Search</button>
+</div>
+
+<label style="margin-top:10px;font-weight:normal">
+  <input type="checkbox" id="modeToggle"> Tech Mode
+</label>
+
+<div id="status" class="hint" style="margin-top:6px"></div>
+
+<!-- Non-tech Mode -->
+<div id="simpleResult" class="card hidden">
+  <div class="title">Address Found</div>
+  <div id="readablePills"></div>
+</div>
+
+<!-- Tech Mode -->
+<div id="techResult" class="result hidden">
+  <h3>Structured Address Levels</h3>
+  <table>
+    <tr><th>Field</th><th>Value</th></tr>
+    <tr><td>Country (level_1)</td><td id="out_country"></td></tr>
+    <tr><td>Region/State (level_2)</td><td id="out_region"></td></tr>
+    <tr><td>City/District (level_3)</td><td id="out_city"></td></tr>
+    <tr><td>Locality/Area (level_4)</td><td id="out_locality"></td></tr>
+    <tr><td>Postal Code</td><td id="out_postal"></td></tr>
+    <tr><td>Coordinates</td><td id="out_coords"></td></tr>
+  </table>
+  <h4 style="margin-top:12px">JSON Output</h4>
+  <pre id="out_json"></pre>
+</div>
+
+<script>
+const OPENCAGE_API_KEY = "41cd92a9c922441aa7443c9b44981837";   // replace with your key
+const $ = id => document.getElementById(id);
+const setStatus = (msg, err=false) => {
+  const s = $("status");
+  s.textContent = msg;
+  s.className = err ? "hint error" : "hint";
+};
+
+// Global state to prevent duplicate requests
+let isLoading = false;
+
+$("lookup").addEventListener("click", lookup);
+$("modeToggle").addEventListener("change", () => toggleMode($("modeToggle").checked));
+
+function toggleMode(tech) {
+  $("techResult").classList.toggle("hidden", !tech);
+  $("simpleResult").classList.toggle("hidden", tech);
+}
+
+/**
+ * Robust fetch wrapper with timeout
+ */
+async function fetchWithTimeout(url, options = {}, timeout = 5000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+    clearTimeout(id);
+    return response;
+  } catch (err) {
+    clearTimeout(id);
+    if (err.name === 'AbortError') {
+      throw new Error('Request timed out');
+    }
+    throw err;
+  }
+}
+
+/**
+ * Main lookup function
+ */
+async function lookup() {
+  if (isLoading) {
+    setStatus("Please wait, a search is in progress...");
+    return;
+  }
+  isLoading = true;
+  $("lookup").disabled = true;
+  $("lookup").textContent = "Searching...";
+  // Hide old results
+  $("simpleResult").classList.add("hidden");
+  $("techResult").classList.add("hidden");
+  setStatus("Searching (parallel)..."); // Changed status message
+
+  const postal = $("postal").value.trim();
+  const country = $("country").value.trim();
+
+  try {
+    if (!postal) {
+      throw new Error("Please enter a postal / ZIP code");
+    }
+
+    // --- PERFORMANCE FIX: Run requests in parallel ---
+    const openCagePromise = fromOpenCage(postal, country);
+    const nominatimPromise = fromNominatim(postal, country);
+
+    // Promise.any() waits for the *first* promise to fulfill
+    const { data, source } = await Promise.any([openCagePromise, nominatimPromise]);
+
+    // 3. Check for total failure (this is now handled by Promise.any's catch block)
+    if (!data) {
+      // This case should rarely be hit if services return empty arrays,
+      // but good to have as a safeguard.
+      throw new Error("No address found for this postal code and country.");
+    }
+    
+    setStatus(`Found via ${source}. Mapping...`);
+
+    const mapped = mapToLevels(data, data); // Pass raw data for recovery logic
+
+    // 4. 🔧 UNIVERSAL REGION RECOVERY LOGIC (for city-states / territories)
+    // This runs *only if* mapToLevels failed to find a region (level_2)
+    if (!mapped.region) {
+      let derived = null;
+      const countryName = (mapped.country || "").toLowerCase();
+      const cityName = (mapped.city || "").toLowerCase();
+      
+      // We must have a city name to make any kind of guess
+      if (cityName) {
+        
+        // --- Heuristic 1: Known Single-Tier Countries ---
+        // For these, the city is always the region.
+        const singleTierCountries = /singapore|vatican|monaco|hong kong|macau|andorra|san marino|liechtenstein|qatar|bahrain|kuwait|iceland|malta|maldives|djibouti/i;
+        if (singleTierCountries.test(countryName)) {
+          derived = mapped.city;
+        }
+
+        // --- Heuristic 2: Specific Known Edge Cases (India UTs) ---
+        else if (countryName === 'india') {
+          if (cityName === 'new delhi') {
+            derived = 'Delhi'; // Specific fix for New Delhi
+          } 
+          // For other UTs, the city name is the region name
+          else if (/delhi|chandigarh|puducherry|daman|diu|lakshadweep|andaman|nicobar/i.test(cityName)) {
+            derived = mapped.city; 
+          }
+        }
+        
+        // --- Heuristic 3: General City-State / Federal District (Heuristics) ---
+        // This is for places like Berlin, Hamburg, Washington D.C., Mexico City, etc.
+        // where the API provides a 'city' but no 'state' because they are the same.
+        if (!derived) {
+          if (
+            // German city-states (Stadtstaaten)
+            (countryName === 'germany' && /berlin|hamburg|bremen/i.test(cityName)) ||
+            
+            // US Federal District (check display_name for "D.C.")
+            // *** BUG FIX: Was using 'data', should be 'rawData' ***
+            (countryName === 'united states' && /washington/i.test(cityName) && /d\.c\./i.test((mapped.raw.formatted || mapped.raw.display_name || "").toLowerCase())) ||
+
+            // General naming clues for capital districts
+            cityName.includes('city') || 
+            cityName.includes('district') || 
+            /d\.c\.$/.test(cityName) ||
+            cityName.includes('metropolitan area')
+          ) {
+            derived = mapped.city;
+          }
+        }
+      } // end if(cityName)
+      
+      // --- Apply the derived value if one was found ---
+      if (derived) {
+        mapped.region = derived;
+        mapped.levels.level_2 = derived; // Also update the levels object
+        console.log("Region recovered universally as:", derived);
+      }
+    }
+
+
+    // 5. ✅ Validation
+    
+    // **FIX**: If API doesn't return a postal code, trust the user's input
+    // as long as other fields (city, country) were found.
+    if (!mapped.postal) {
+      console.warn("API did not return a postal code. Falling back to user input.");
+      mapped.postal = postal; // Use the original user-entered postal code
+    }
+
+    // **FIX**: Use robust comparison for alphanumeric postal codes (removes spaces, hyphens, etc.)
+    const enteredNorm = postal.replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+    const resolvedNorm = mapped.postal.replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+    
+    // Check for a mismatch. Allow partial matches (e.g., "90210" vs "90210-1234")
+    // This checks if neither string starts with the other.
+    if (resolvedNorm !== enteredNorm && !resolvedNorm.startsWith(enteredNorm) && !enteredNorm.startsWith(resolvedNorm)) {
+      throw new Error(`Postal code mismatch: Entered ${postal}, found ${mapped.postal}`);
+    }
+
+
+    // 6. ✅ Check for mandatory fields
+    const missing = [];
+    if (!mapped.country) missing.push("Country");
+    if (!mapped.region) missing.push("State/Region");
+    if (!mapped.city) missing.push("City/District");
+    if (missing.length) {
+      throw new Error("Address incomplete. Missing: " + missing.join(", "));
+    }
+
+    // 7. Render results
+    render(mapped, source);
+    setStatus(`Done (via ${source})`);
+
+  } catch (err) {
+    // Central error handler
+    if (err instanceof AggregateError) {
+      // This block runs if *all* promises in Promise.any() failed
+      console.error("All services failed:", err.errors);
+      setStatus("No address found for this postal code and country.", true);
+    } else {
+      // This handles validation errors or other single-point failures
+      console.error("Lookup process failed:", err);
+      setStatus(err.message, true);
+    }
+  } finally {
+    // This *always* runs, re-enabling the UI
+    isLoading = false;
+    $("lookup").disabled = false;
+    $("lookup").textContent = "Search";
+  }
+}
+
+/**
+ * Tries to fetch from OpenCage.
+ * Returns {data, source} on success, throws error on failure.
+ */
+async function fromOpenCage(postal, country) {
+  const q = encodeURIComponent(postal + (country ? " " + country : ""));
+  const url = `https://api.opencagedata.com/geocode/v1/json?q=${q}&key=${OPENCAGE_API_KEY}&no_annotations=1&limit=1`;
+  const res = await fetchWithTimeout(url, {}, 5000); // 5 sec timeout
+  if (!res.ok) throw new Error("OpenCage HTTP " + res.status);
+  const json = await res.json();
+  
+  const result = json.results && json.results[0];
+  if (!result) throw new Error("OpenCage returned no result");
+
+  // Check for low-confidence matches (e.g., just returning the country)
+  if (result.components && (result.components._type === 'country' || result.components._type === 'continent')) {
+    console.warn("OpenCage returned a low-confidence match. Ignoring.");
+    throw new Error("OpenCage low-confidence match"); // Reject this promise
+  }
+  
+  return { data: result, source: "OpenCage" };
+}
+
+/**
+ * Tries to fetch from Nominatim.
+ * Returns {data, source} on success, throws error on failure.
+ */
+async function fromNominatim(postal, country) {
+  // --- BUG FIX: Reverted to robust 'q=' parameter ---
+  const q = encodeURIComponent(postal + (country ? " " + country : ""));
+  const url = `https://nominatim.openstreetmap.org/search?format=json&addressdetails=1&q=${q}&limit=1`;
+  
+  const res = await fetchWithTimeout(url, { headers: { 'User-Agent': 'AddressLookup/1.0' } }, 5000);
+  if (!res.ok) throw new Error("Nominatim HTTP " + res.status);
+  const json = await res.json();
+  
+  if (!json || json.length === 0) {
+    throw new Error("Nominatim returned no result"); // Reject this promise
+  }
+  
+  return { data: json[0], source: "Nominatim" };
+}
+
+/**
+ * Maps disparate API responses to a single, consistent object
+ */
+function mapToLevels(r, rawData) { // Pass rawData for recovery logic
+  // OpenCage uses 'components', Nominatim uses 'address'
+  const c = r.components || r.address || {};
+  
+  // Helper to pick the first non-empty value from a list of keys
+  const pick = (...keys) => {
+    for (const key of keys) {
+      if (c[key] && c[key].length) return c[key];
+    }
+    return undefined; // Explicitly return undefined if none found
+  };
+
+  // Standardized fields
+  const country = pick("country");
+  // Region (State/Province): Prioritizes state, then administrative districts
+  const region = pick("state", "state_district", "region", "province", "county", "area", "macroregion");
+  // City: Prioritizes city/town, but falls back to municipality or district
+  const city = pick("city", "town", "village", "municipality", "subdistrict", "district", "state_district", "county");
+  // Locality: A more specific area (suburb, road)
+  let locality = pick("suburb", "neighbourhood", "locality", "hamlet", "quarter", "road");
+
+  // Fallback for locality: Use the first part of the full address string
+  if (!locality && (r.formatted || r.display_name)) {
+    const parts = (r.formatted || r.display_name).split(",").map(x => x.trim());
+    if (parts.length > 2) locality = parts[0]; // Avoid picking the city or country
+  }
+
+  // Postal Code: Check both common keys
+  const postal = pick("postcode", "postal_code");
+
+  // Coordinates: OpenCage uses {geometry: {lat, lng}}, Nominatim uses {lat, lon}
+  const lat = r.geometry?.lat || r.lat;
+  const lon = r.geometry?.lng || r.lon;
+
+  return {
+    country, region, city, locality, postal,
+    coords: lat && lon ? `${parseFloat(lat).toFixed(6)}, ${parseFloat(lon).toFixed(6)}` : "",
+    levels: { level_1: country, level_2: region, level_3: city, level_4: locality },
+    raw: rawData // Keep raw data for debugging
+  };
+}
+
+function render(m, src) {
+  const parts = [m.locality, m.city, m.region, m.country, m.postal].filter(Boolean);
+  $("readablePills").innerHTML = parts.map(p => `<span class="pill">${p}</span>`).join("");
+
+  $("out_country").textContent = m.country || "";
+  $("out_region").textContent = m.region || "";
+  $("out_city").textContent = m.city || "";
+  $("out_locality").textContent = m.locality || "";
+  $("out_postal").textContent = m.postal || "";
+  $("out_json").textContent = JSON.stringify({ ...m, source: src }, null, 2);
+
+  const tech = $("modeToggle").checked;
+  toggleMode(tech);
+  // Show the correct result card
+  $(tech ? "techResult" : "simpleResult").classList.remove("hidden");
+}
+</script>
+</body>
+</html>
