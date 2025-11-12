@@ -270,7 +270,8 @@ async function lookup() {
  * Returns {data, source} on success, throws error on failure.
  */
 async function fromOpenCage(postal, country) {
-  const q = encodeURIComponent(postal + (country ? " " + country : ""));
+  // --- REFINED: Use comma-separated query for better results ---
+  const q = encodeURIComponent(postal + (country ? ", " + country : "")); // Use comma
   const url = `https://api.opencagedata.com/geocode/v1/json?q=${q}&key=${OPENCAGE_API_KEY}&no_annotations=1&limit=1`;
   const res = await fetchWithTimeout(url, {}, 5000); // 5 sec timeout
   if (!res.ok) throw new Error("OpenCage HTTP " + res.status);
@@ -293,9 +294,19 @@ async function fromOpenCage(postal, country) {
  * Returns {data, source} on success, throws error on failure.
  */
 async function fromNominatim(postal, country) {
-  // --- BUG FIX: Reverted to robust 'q=' parameter ---
-  const q = encodeURIComponent(postal + (country ? " " + country : ""));
-  const url = `https://nominatim.openstreetmap.org/search?format=json&addressdetails=1&q=${q}&limit=1`;
+  // --- REFINED: Use structured postalcode and country parameters ---
+  const params = new URLSearchParams({
+    format: 'json',
+    addressdetails: '1',
+    limit: '1',
+    postalcode: postal
+  });
+
+  if (country) {
+    params.set('country', country);
+  }
+  
+  const url = `https://nominatim.openstreetmap.org/search?${params.toString()}`;
   
   const res = await fetchWithTimeout(url, { headers: { 'User-Agent': 'AddressLookup/1.0' } }, 5000);
   if (!res.ok) throw new Error("Nominatim HTTP " + res.status);
@@ -362,6 +373,7 @@ function render(m, src) {
   $("out_city").textContent = m.city || "";
   $("out_locality").textContent = m.locality || "";
   $("out_postal").textContent = m.postal || "";
+  $("out_coords").textContent = m.coords || "";
   $("out_json").textContent = JSON.stringify({ ...m, source: src }, null, 2);
 
   const tech = $("modeToggle").checked;
